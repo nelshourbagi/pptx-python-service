@@ -1,21 +1,35 @@
 import base64
 import io
 import re
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import traceback
 from typing import Dict, List, Any, Optional, Tuple
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from pptx import Presentation
 from pptx.table import Table
 
 app = FastAPI()
 
-# ─────────────────────────────────────────────────────────────
-# Version (use this to confirm Railway is running latest code)
-# ─────────────────────────────────────────────────────────────
+# Change this any time you redeploy, so you can confirm Railway is live-updated
+SERVICE_VERSION = "header-scan-v2"
 
-@app.get("/version")
-async def version():
-    return {"version": "section-row-is-header-v1"}
+
+# ─────────────────────────────────────────────────────────────
+# Global exception handler (so Railway won't return plain text 500)
+# ─────────────────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "type": exc.__class__.__name__,
+            "traceback": traceback.format_exc(),
+            "version": SERVICE_VERSION,
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -57,7 +71,7 @@ class CanonicalData(BaseModel):
 
 class Binding(BaseModel):
     id: str
-    type: str  # "text" | "table"
+    type: str
 
 
 class MappingConfig(BaseModel):
@@ -79,31 +93,29 @@ class ProcessResponse(BaseModel):
 # Helpers
 # ─────────────────────────────────────────────────────────────
 
-_SUPERSCRIPT_MAP = str.maketrans({
-    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
-    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
-})
-
 def _norm(s: Any) -> str:
-    """Generic normalization for headers and values."""
+    """
+    Normalize text for matching:
+    - string cast
+    - trim
+    - collapse whitespace
+    - remove common footnote/superscript artifacts
+    """
     if s is None:
         return ""
-    s = str(s)
-    s = s.replace("\u00a0", " ")  # non-breaking space
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    t = str(s).strip()
+    t = re.sub(r"\s+", " ", t)
 
-def _norm_key(s: Any) -> str:
-    """Normalization for row keys (handles superscripts / whitespace / case)."""
-    s = _norm(s)
-    s = s.translate(_SUPERSCRIPT_MAP)
-    s = s.lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    # Remove Unicode superscripts ¹²³⁴⁵⁶⁷⁸⁹⁰ and common footnote markers
+    t = re.sub(r"[¹²³⁴⁵⁶⁷⁸⁹⁰]+$", "", t).strip()
+    t = re.sub(r"[\*\u2020\u2021]+$", "", t).strip()  # *, †, ‡ at end
+
+    return t
+
 
 def _header_matches(canonical_h: str, ppt_h: str) -> bool:
     """
-    Partial-friendly header matching with parenthetical qualifier stripping.
+    Partial-friendly header matching with parenthetical stripping.
     Examples:
       "3 year (annl)" matches "3 year"
       "Current AUM ($m)" matches "Current AUM"
@@ -117,56 +129,55 @@ def _header_matches(canonical_h: str, ppt_h: str) -> bool:
     if ch in ph or ph in ch:
         return True
 
-    # Strip trailing parentheticals and retry
+    # Strip trailing parenthetical qualifiers and retry
     ch2 = re.sub(r"\s*\([^)]*\)\s*$", "", ch).strip()
     ph2 = re.sub(r"\s*\([^)]*\)\s*$", "", ph).strip()
-    if not ch2 or not ph2:
-        return False
-    return (ch2 == ph2) or (ch2 in ph2) or (ph2 in ch2)
+    return bool(ch2 and ph2 and (ch2 == ph2 or ch2 in ph2 or ph2 in ch2))
+
 
 def get_shape_alt_text(shape) -> str:
-    """Extract alt text (Description) from a shape."""
     try:
         desc = shape._element.xpath(".//*[local-name()='cNvPr']/@descr")
         if desc:
             return desc[0]
     except Exception:
         pass
+
     try:
         return shape.name or ""
     except Exception:
         return ""
 
+
 def update_text_shape(shape, formatted_value: str):
-    """Replace text while preserving formatting (first run of first paragraph)."""
     if not shape.has_text_frame:
         return
     tf = shape.text_frame
     if not tf.paragraphs:
         return
 
-    p0 = tf.paragraphs[0]
-    if p0.runs:
-        p0.runs[0].text = formatted_value
-        for r in p0.runs[1:]:
-            r._r.getparent().remove(r._r)
+    para = tf.paragraphs[0]
+
+    if para.runs:
+        para.runs[0].text = formatted_value
+        for run in para.runs[1:]:
+            run._r.getparent().remove(run._r)
     else:
-        p0.text = formatted_value
+        para.text = formatted_value
 
     for p in tf.paragraphs[1:]:
         p._p.getparent().remove(p._p)
 
+
 def _is_section_header(cell_text: str) -> bool:
-    """
-    Your table uses a row like:
-      "Net Returns (USD) (Nov 30, 2025)"
-    as the start of a section.
-    """
+    # Detect section header rows by checking if column-0 text starts with 'Net Returns'
     return _norm(cell_text).lower().startswith("net returns")
+
 
 def _extract_trailing_paren_value(text: str) -> Optional[str]:
     m = re.search(r"\(([^)]*)\)\s*$", _norm(text))
     return m.group(1).strip() if m else None
+
 
 def _update_cell_text_preserve_first_run(cell, new_text: str) -> None:
     if not cell.text_frame or not cell.text_frame.paragraphs:
@@ -183,90 +194,117 @@ def _update_cell_text_preserve_first_run(cell, new_text: str) -> None:
     for p in tf.paragraphs[1:]:
         p._p.getparent().remove(p._p)
 
+
 def _update_section_header_date(cell, new_date: str) -> None:
     """
-    Replace ONLY the trailing (date) portion in the section header cell text.
-    Works even if text is split across runs.
+    Replace trailing (date) in the section header cell.
     """
     if not cell.text_frame:
         return
     full_text = cell.text_frame.text or ""
-    updated_text = re.sub(r"\([^)]*\)\s*$", f"({new_date})", _norm(full_text))
-    if updated_text and updated_text != _norm(full_text):
+    updated_text = re.sub(r"\([^)]*\)\s*$", f"({new_date})", full_text.strip())
+    if updated_text != full_text.strip():
         _update_cell_text_preserve_first_run(cell, updated_text)
 
 
-# ─────────────────────────────────────────────────────────────
-# Table updater
-# ─────────────────────────────────────────────────────────────
+def _score_header_row(table: Table, row_idx: int, canonical_headers: List[str]) -> Tuple[int, List[str]]:
+    """
+    Score a candidate header row by how many canonical headers match.
+    Returns (score, candidate_headers_list).
+    """
+    if row_idx < 0 or row_idx >= len(table.rows):
+        return 0, []
+    candidate_headers = [_norm(c.text) for c in table.rows[row_idx].cells[1:]]  # skip col 0
+    score = 0
+    for ch in canonical_headers:
+        for ph in candidate_headers:
+            if _header_matches(ch, ph):
+                score += 1
+                break
+    return score, candidate_headers
+
+
+def _detect_header_row_idx(table: Table, sh_row_idx: int, canonical_headers: List[str], scan_depth: int = 4) -> Tuple[int, int, List[str]]:
+    """
+    Scan rows sh_row_idx+1 .. sh_row_idx+scan_depth and pick best header row.
+    Returns: (best_row_idx, best_score, chosen_headers)
+    """
+    best_idx = min(sh_row_idx + 1, len(table.rows) - 1)
+    best_score = 0
+    best_headers: List[str] = []
+
+    last_row = min(len(table.rows) - 1, sh_row_idx + scan_depth)
+    for ridx in range(sh_row_idx + 1, last_row + 1):
+        score, headers = _score_header_row(table, ridx, canonical_headers)
+        if score > best_score:
+            best_score = score
+            best_idx = ridx
+            best_headers = headers
+
+    if not best_headers and best_idx < len(table.rows):
+        best_headers = [_norm(c.text) for c in table.rows[best_idx].cells[1:]]
+
+    return best_idx, best_score, best_headers
+
 
 def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: List[str], binding_id: str):
     """
-    Section-aware table updater for your Slide 2 layout.
-
-    Key rule for this template:
-    - The section header row (where col0 starts with "Net Returns") ALSO contains
-      the true column headers in columns 1..end (e.g. "2025 YTD", "3 year (annl)", ...).
-      So for each section:
-        col_header_row_idx = sh_row_idx
-        data starts at sh_row_idx + 1
-
-    Falls back to generic flat update if no sections are detected/provided.
+    Section-aware table updater:
+    - Detects section header rows (col 0 starts with "Net Returns")
+    - Chooses the REAL header row by scanning a few rows after the section header
+    - Updates by matching row_key (col 0) and col_key (header text)
+    - Updates section header dates via canonical_table.meta.section_dates
+    - Falls back to flat matching if section data isn't present
     """
-
     if len(table.rows) < 2:
         errors.append(f"Table '{binding_id}' has fewer than 2 rows")
         return
 
     total_rows = len(table.rows)
 
-    # Detect section header row indices
+    # detect section headers
     section_header_indices: List[int] = []
     for row_idx in range(total_rows):
-        cell0_text = table.rows[row_idx].cells[0].text
-        if _is_section_header(cell0_text):
+        if _is_section_header(table.rows[row_idx].cells[0].text):
             section_header_indices.append(row_idx)
 
-    has_sections = (
-        len(section_header_indices) > 0
-        and canonical_table.sections
-        and len(canonical_table.sections) > 0
-    )
+    has_sections = bool(section_header_indices) and canonical_table.sections and len(canonical_table.sections) > 0
 
-    # ── Flat fallback (generic table: row0 headers, col0 row label) ──
+    # ── Flat fallback (no sections) ────────────────────────────
     if not has_sections:
-        header_row_idx = 0
-        ppt_headers = [_norm(c.text) for c in table.rows[header_row_idx].cells[1:]]  # skip col0
-        ppt_header_norms = [_norm(h) for h in ppt_headers]
+        headers = [_norm(c.text) for c in table.rows[0].cells]
+        if len(headers) < 2:
+            errors.append(f"Table '{binding_id}': expected at least 2 columns")
+            return
 
-        # Build lookup (normalized header -> column index)
         col_lookup: Dict[str, int] = {}
-        for idx, h in enumerate(ppt_header_norms, start=1):
+        for idx in range(1, len(headers)):
+            h = headers[idx]
             if h:
-                col_lookup[h] = idx
+                col_lookup[_norm(h)] = idx
 
-        canonical_rows = { _norm_key(r.row_key): r for r in canonical_table.rows }
+        canonical_row_lookup = {_norm(r.row_key): r for r in canonical_table.rows}
 
         updated = 0
         for row_idx in range(1, total_rows):
             row = table.rows[row_idx]
-            row_label = _norm_key(row.cells[0].text)
+            row_label = _norm(row.cells[0].text)
             if not row_label:
                 continue
-            cr = canonical_rows.get(row_label)
+            cr = canonical_row_lookup.get(row_label)
             if not cr:
                 continue
 
             for ck, cv in cr.cells.items():
-                # Find matching column index using partial-friendly match
-                ck_norm = _norm(ck)
+                # find col index by match
                 col_idx = None
+                ck_norm = _norm(ck)
                 if ck_norm in col_lookup:
                     col_idx = col_lookup[ck_norm]
                 else:
-                    for ph, i in col_lookup.items():
-                        if _header_matches(ck_norm, ph):
-                            col_idx = i
+                    for ppt_h, idx in col_lookup.items():
+                        if _header_matches(ck_norm, ppt_h):
+                            col_idx = idx
                             break
                 if col_idx is None:
                     continue
@@ -281,23 +319,15 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
                     updated += 1
 
         if updated == 0:
-            errors.append(
-                f"DEBUG {binding_id}: 0 cells updated (flat). "
-                f"PPT_headers(sample)={ppt_headers[:10]} | "
-                f"PPT_rows(sample)={[ _norm(table.rows[i].cells[0].text) for i in range(1, min(total_rows, 12)) ]} | "
-                f"Canonical_rows(sample)={[r.row_key for r in canonical_table.rows[:10]]} | "
-                f"Canonical_headers(sample)={canonical_table.headers[:10]}"
-            )
+            errors.append(f"DEBUG {binding_id}: 0 cells updated (flat). headers={headers[:10]}")
         return
 
-    # ── Section-aware update ──
+    # ── Section-aware update ───────────────────────────────────
     section_dates: Dict[str, str] = {}
     if canonical_table.meta and canonical_table.meta.section_dates:
         section_dates = canonical_table.meta.section_dates
 
-    # Resolve section labels deterministically:
-    # - If header has a trailing (date) matching section_dates -> use that key
-    # - Else positional (Top, Bottom, Section3...)
+    # resolve section labels by position (Top/Bottom) unless matched by date
     positional_labels = ["Top", "Bottom", "Section3", "Section4"]
     resolved_sections: List[str] = []
 
@@ -314,66 +344,50 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
 
         if not resolved:
             resolved = positional_labels[idx] if idx < len(positional_labels) else f"Section{idx+1}"
-
         resolved_sections.append(resolved)
 
     updated_cells_count = 0
-    section_debug: List[Dict[str, Any]] = []
+    section_debug_info: Dict[str, Any] = {}
 
     for sec_idx, sh_row_idx in enumerate(section_header_indices):
         section_label = resolved_sections[sec_idx]
         sec_data = canonical_table.sections.get(section_label) if canonical_table.sections else None
 
-        # Update the as-of date in the section header cell col0 (optional)
+        # update header date text
         if section_label in section_dates:
             _update_section_header_date(table.rows[sh_row_idx].cells[0], section_dates[section_label])
 
-        # For THIS template: section header row IS the header row
-        col_header_row_idx = sh_row_idx
-        data_row_start = col_header_row_idx + 1
-
-        # Determine where section ends (next section header or end)
-        next_sh = section_header_indices[sec_idx + 1] if sec_idx + 1 < len(section_header_indices) else total_rows
-
-        # Read headers for this section from the section header row cells[1:]
-        chosen_headers = [_norm(c.text) for c in table.rows[col_header_row_idx].cells[1:]]  # skip col0 title
-        chosen_headers_norm = [_norm(h) for h in chosen_headers]
-
-        # Build lookup (normalized header -> column index)
-        sec_col_lookup: Dict[str, int] = {}
-        for idx2, h in enumerate(chosen_headers_norm, start=1):
-            if h:
-                sec_col_lookup[h] = idx2
-
         if not sec_data:
-            section_debug.append({
-                "section": section_label,
-                "col_header_row_idx": col_header_row_idx,
-                "note": "no canonical section data"
-            })
+            section_debug_info[section_label] = {"skipped": "no canonical section data"}
             continue
 
-        # Canonical row lookup for this section (normalized)
-        sec_row_lookup = { _norm_key(r.row_key): r for r in sec_data.rows }
+        # find correct header row by scanning
+        chosen_header_row_idx, chosen_score, chosen_headers = _detect_header_row_idx(
+            table,
+            sh_row_idx,
+            sec_data.headers,
+            scan_depth=4,
+        )
 
-        # Helper: find column index for a canonical header using partial match
-        def find_col_idx(canonical_header: str) -> Optional[int]:
-            ch = _norm(canonical_header)
-            if ch in sec_col_lookup:
-                return sec_col_lookup[ch]
-            for ph, i in sec_col_lookup.items():
-                if _header_matches(ch, ph):
-                    return i
-            return None
+        # next section header boundary
+        next_sh = section_header_indices[sec_idx + 1] if sec_idx + 1 < len(section_header_indices) else total_rows
+        data_row_start = chosen_header_row_idx + 1
 
-        # Update rows in this section
+        # build lookup from chosen headers
+        sec_col_lookup: Dict[str, int] = {}
+        for idx2, h in enumerate(chosen_headers, start=1):
+            hn = _norm(h)
+            if hn:
+                sec_col_lookup[hn] = idx2
+
+        # row lookup
+        sec_row_lookup = {_norm(r.row_key): r for r in sec_data.rows}
+
+        # update rows
         for row_idx in range(data_row_start, next_sh):
             row = table.rows[row_idx]
-            row_label_raw = row.cells[0].text
-            row_label = _norm_key(row_label_raw)
-            if not row_label:
-                continue
-            if _is_section_header(row_label_raw):
+            row_label = _norm(row.cells[0].text)
+            if not row_label or _is_section_header(row_label):
                 continue
 
             cr = sec_row_lookup.get(row_label)
@@ -381,7 +395,15 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
                 continue
 
             for ck, cv in cr.cells.items():
-                col_idx = find_col_idx(ck)
+                ck_norm = _norm(ck)
+                col_idx = None
+                if ck_norm in sec_col_lookup:
+                    col_idx = sec_col_lookup[ck_norm]
+                else:
+                    for ppt_h, idx3 in sec_col_lookup.items():
+                        if _header_matches(ck_norm, ppt_h):
+                            col_idx = idx3
+                            break
                 if col_idx is None:
                     continue
 
@@ -394,50 +416,41 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
                         p.text = cv.formatted
                     updated_cells_count += 1
 
-        section_debug.append({
-            "section": section_label,
-            "col_header_row_idx": col_header_row_idx,
-            "headers_sample": chosen_headers[:10],
-            "rows_range": [data_row_start, next_sh - 1],
-        })
+        section_debug_info[section_label] = {
+            "chosen_header_row_idx": chosen_header_row_idx,
+            "chosen_header_score": chosen_score,
+            "chosen_headers_sample": chosen_headers[:10],
+        }
 
     if updated_cells_count == 0:
-        # Samples for debugging
-        sample_ppt_headers = []
-        if section_header_indices:
-            sample_ppt_headers = [_norm(c.text) for c in table.rows[section_header_indices[0]].cells[1:]][:10]
-
-        sample_ppt_rows = []
-        # Show first ~10 row labels after first section header
-        if section_header_indices:
-            start = section_header_indices[0] + 1
-            for i in range(start, min(total_rows, start + 12)):
-                sample_ppt_rows.append(_norm(table.rows[i].cells[0].text))
-
-        sample_canonical_rows = []
-        sample_canonical_headers = []
-        if canonical_table.sections:
-            for _, sd in canonical_table.sections.items():
-                sample_canonical_rows = [r.row_key for r in sd.rows[:10]]
-                sample_canonical_headers = [h for h in sd.headers[:10]]
-                break
-
+        # include helpful debug if nothing changed
+        ppt_rows_sample: List[str] = []
+        for r in range(0, min(total_rows, 20)):
+            rl = _norm(table.rows[r].cells[0].text)
+            if rl and not _is_section_header(rl):
+                ppt_rows_sample.append(rl)
         errors.append(
             f"DEBUG {binding_id}: 0 cells updated (sectioned). "
-            f"section_headers={section_header_indices} | "
-            f"resolved={resolved_sections} | "
-            f"header_row_is_section_row=true | "
-            f"section_debug={section_debug} | "
-            f"PPT_headers(sample)={sample_ppt_headers} | "
-            f"PPT_rows(sample)={sample_ppt_rows} | "
-            f"Canonical_rows(sample)={sample_canonical_rows} | "
-            f"Canonical_headers(sample)={sample_canonical_headers}"
+            f"section_headers={section_header_indices}, resolved={resolved_sections}. "
+            f"header_choice={section_debug_info}. "
+            f"PPT_rows(sample)={ppt_rows_sample[:10]}. "
+            f"Canonical_rows(sample)={[_norm(x.row_key) for x in (list(canonical_table.sections.values())[0].rows[:10] if canonical_table.sections else [])]}"
         )
 
 
 # ─────────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": SERVICE_VERSION}
+
+
+@app.get("/version")
+async def version():
+    return {"version": SERVICE_VERSION}
+
 
 @app.post("/", response_model=ProcessResponse)
 async def process_pptx(request: ProcessRequest):
@@ -484,7 +497,3 @@ async def process_pptx(request: ProcessRequest):
         output_base64=base64.b64encode(output.read()).decode("utf-8"),
         errors=errors,
     )
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
