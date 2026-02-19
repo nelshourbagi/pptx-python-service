@@ -4,7 +4,7 @@ import re
 import traceback
 from typing import Dict, List, Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pptx import Presentation
@@ -12,11 +12,11 @@ from pptx.table import Table
 
 app = FastAPI()
 
-SERVICE_VERSION = "section-header-direct-v1"
+SERVICE_VERSION = "section-header-direct-v2"
 
 
 # ─────────────────────────────────────────────────────────────
-# Global exception handler
+# Global exception handler (so Supabase sees real Python error)
 # ─────────────────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -113,10 +113,10 @@ def _header_matches(canonical_h: str, ppt_h: str) -> bool:
     if ch in ph or ph in ch:
         return True
 
+    # remove parenthetical qualifiers and retry
     ch2 = re.sub(r"\s*\([^)]*\)\s*$", "", ch).strip()
     ph2 = re.sub(r"\s*\([^)]*\)\s*$", "", ph).strip()
-
-    return ch2 == ph2
+    return bool(ch2 and ph2 and (ch2 == ph2 or ch2 in ph2 or ph2 in ch2))
 
 
 def get_shape_alt_text(shape) -> str:
@@ -133,57 +133,82 @@ def get_shape_alt_text(shape) -> str:
         return ""
 
 
+def _is_section_header(text: str) -> bool:
+    return _norm(text).lower().startswith("net returns")
+
+
 # ─────────────────────────────────────────────────────────────
-# Table Updater (FINAL FIX)
+# Table updater (Section header row contains the column headers)
+# IMPORTANT: do NOT slice pptx collections (row.cells[1:] breaks)
 # ─────────────────────────────────────────────────────────────
 
 def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: List[str], binding_id: str):
-
     total_rows = len(table.rows)
     updated = 0
 
-    # Detect section header rows
-    section_rows = []
+    # Find section header rows in the PPT (col 0 starts with "Net Returns")
+    section_header_indices: List[int] = []
     for i in range(total_rows):
-        if _norm(table.rows[i].cells[0].text).lower().startswith("net returns"):
-            section_rows.append(i)
+        try:
+            cell0 = table.rows[i].cells[0].text
+        except Exception:
+            cell0 = ""
+        if _is_section_header(cell0):
+            section_header_indices.append(i)
 
-    if not section_rows or not canonical_table.sections:
-        errors.append(f"DEBUG {binding_id}: no sections detected")
+    if not section_header_indices or not canonical_table.sections:
+        errors.append(
+            f"DEBUG {binding_id}: no sections detected or canonical_table.sections missing. "
+            f"ppt_section_headers={section_header_indices} version={SERVICE_VERSION}"
+        )
         return
 
-    section_labels = list(canonical_table.sections.keys())
+    # Use canonical section order as provided (Top/Bottom)
+    canonical_section_labels = list(canonical_table.sections.keys())
 
-    for idx, sh_row_idx in enumerate(section_rows):
+    header_choice_debug: Dict[str, Any] = {}
 
-        section_label = section_labels[idx] if idx < len(section_labels) else None
-        if not section_label:
-            continue
-
+    for sec_idx, sh_row_idx in enumerate(section_header_indices):
+        section_label = canonical_section_labels[sec_idx] if sec_idx < len(canonical_section_labels) else f"Section{sec_idx+1}"
         sec_data = canonical_table.sections.get(section_label)
         if not sec_data:
             continue
 
-        # Header row is the section row itself
+        # In this PPT layout: section header row IS the header row
         header_row_idx = sh_row_idx
 
-        # Extract header texts from same row (skip col0)
-        header_cells = table.rows[header_row_idx].cells
-        ppt_headers = [_norm(c.text) for c in header_cells[1:]]
+        # Build col_lookup from that same row, columns 1..end
+        header_row = table.rows[header_row_idx]
+        ncols = len(header_row.cells)
 
+        ppt_headers: List[str] = []
         col_lookup: Dict[str, int] = {}
-        for col_i, h in enumerate(ppt_headers, start=1):
-            col_lookup[h] = col_i
 
-        next_section = section_rows[idx + 1] if idx + 1 < len(section_rows) else total_rows
+        for j in range(1, ncols):
+            h = _norm(header_row.cells[j].text)
+            ppt_headers.append(h)
+            if h:
+                col_lookup[h] = j
+
+        # Data runs until next section header or end
+        next_sh = section_header_indices[sec_idx + 1] if sec_idx + 1 < len(section_header_indices) else total_rows
         data_start = header_row_idx + 1
 
+        # Canonical rows lookup
         canonical_rows = {_norm(r.row_key): r for r in sec_data.rows}
 
-        for r_i in range(data_start, next_section):
+        # Collect some ppt row labels for debug
+        ppt_rows_sample: List[str] = []
+        for r_i in range(data_start, min(next_sh, data_start + 8)):
+            rl = _norm(table.rows[r_i].cells[0].text)
+            if rl and not _is_section_header(rl):
+                ppt_rows_sample.append(rl)
+
+        # Update cells
+        for r_i in range(data_start, next_sh):
             row = table.rows[r_i]
             row_label = _norm(row.cells[0].text)
-            if not row_label:
+            if not row_label or _is_section_header(row_label):
                 continue
 
             cr = canonical_rows.get(row_label)
@@ -191,11 +216,12 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
                 continue
 
             for ck, cv in cr.cells.items():
-
                 col_idx = None
-                for ppt_h, i_col in col_lookup.items():
+
+                # match canonical header to PPT header using tolerant matching
+                for ppt_h, idx_col in col_lookup.items():
                     if _header_matches(ck, ppt_h):
-                        col_idx = i_col
+                        col_idx = idx_col
                         break
 
                 if col_idx is None:
@@ -210,9 +236,19 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
                         p.text = cv.formatted
                     updated += 1
 
+        header_choice_debug[section_label] = {
+            "header_row_idx": header_row_idx,
+            "ppt_headers(sample)": ppt_headers[:10],
+            "ppt_rows(sample)": ppt_rows_sample[:6],
+            "canonical_headers(sample)": [_norm(h) for h in sec_data.headers][:10],
+            "canonical_rows(sample)": list(canonical_rows.keys())[:6],
+        }
+
     if updated == 0:
         errors.append(
-            f"DEBUG {binding_id}: 0 cells updated (direct-header mode) version={SERVICE_VERSION}"
+            f"DEBUG {binding_id}: 0 cells updated (direct-header mode). "
+            f"sections={section_header_indices} header_debug={header_choice_debug} "
+            f"version={SERVICE_VERSION}"
         )
 
 
@@ -222,7 +258,6 @@ def update_table_shape(table: Table, canonical_table: CanonicalTable, errors: Li
 
 @app.post("/", response_model=ProcessResponse)
 async def process_pptx(request: ProcessRequest):
-
     errors: List[str] = []
 
     template_bytes = base64.b64decode(request.template_base64)
@@ -233,10 +268,20 @@ async def process_pptx(request: ProcessRequest):
     for slide in prs.slides:
         for shape in slide.shapes:
             alt = get_shape_alt_text(shape).strip()
-            if alt in table_bindings and shape.has_table:
+            if not alt:
+                continue
+
+            if alt in table_bindings:
+                if not shape.has_table:
+                    errors.append(f"Binding '{alt}' is not a table")
+                    continue
+
                 canonical_table = request.canonical_data.tables.get(alt)
-                if canonical_table:
-                    update_table_shape(shape.table, canonical_table, errors, alt)
+                if not canonical_table:
+                    errors.append(f"Table binding '{alt}' not found in canonical data")
+                    continue
+
+                update_table_shape(shape.table, canonical_table, errors, alt)
 
     output = io.BytesIO()
     prs.save(output)
