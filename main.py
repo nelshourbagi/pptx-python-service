@@ -301,4 +301,3 @@ async def health():
 @app.get("/version")
 async def version():
     return {"version": SERVICE_VERSION}
-
